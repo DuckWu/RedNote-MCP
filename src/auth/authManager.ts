@@ -1,5 +1,6 @@
 import {Browser, BrowserContext, chromium, Cookie, Page} from 'playwright';
 import {CookieManager} from './cookieManager';
+import {ConfigManager} from './configManager';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -58,108 +59,88 @@ export class AuthManager {
   }
 
   async login(options?: {timeout?: number}): Promise<void> {
-    const timeoutSeconds = options?.timeout || 10
+    const timeoutSeconds = options?.timeout || 120
     logger.info(`Starting login process with timeout: ${timeoutSeconds}s`)
-    const timeoutMs = timeoutSeconds * 1000
-    this.browser = await chromium.launch({
-      headless: false,
-      timeout: timeoutMs,
+
+    this.browser = await chromium.launch({ headless: false })
+    this.context = await this.browser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     })
-    if (!this.browser) {
-      logger.error('Failed to launch browser');
-      throw new Error('Failed to launch browser');
+    this.page = await this.context.newPage()
+
+    // Load existing cookies
+    const cookies = await this.cookieManager.loadCookies()
+    if (cookies.length > 0) {
+      await this.context.addCookies(cookies)
     }
 
-    let retryCount = 0;
-    const maxRetries = 3;
+    // Navigate directly to rednote.com to avoid xiaohongshu.com → rednote.com redirect loop
+    await this.page.goto('https://www.rednote.com/explore', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    })
 
-    while (retryCount < maxRetries) {
-      try {
-        logger.info(`Login attempt ${retryCount + 1}/${maxRetries}`);
-        this.context = await this.browser.newContext();
-        this.page = await this.context.newPage();
+    // Let page fully render (login dialog may animate in)
+    await this.page.waitForTimeout(5000)
 
-        // Load existing cookies if available
-        const cookies = await this.cookieManager.loadCookies();
-        if (cookies && cookies.length > 0) {
-          logger.info(`Loaded ${cookies.length} existing cookies`);
-          await this.context.addCookies(cookies);
+    const currentUrl = this.page.url()
+    logger.info(`Page settled at: ${currentUrl}`)
+
+    // Check login status — use multiple indicators
+    const checkLoggedIn = async (): Promise<boolean> => {
+      if (!this.page) return false
+      return await this.page.evaluate(() => {
+        // Method 1: sidebar channel text
+        const sidebar = document.querySelector('.user.side-bar-component .channel, [class*="side-bar"] [class*="channel"]')
+        const sidebarText = (sidebar?.textContent || '').trim()
+        if (sidebarText === '我' || sidebarText === 'Me' || sidebarText === 'Profile') return true
+
+        // Method 2: user avatar/menu visible
+        const avatar = document.querySelector('.side-bar-user img, .side-bar-user, [class*="user-avatar"] img, [class*="UserAvatar"]')
+        if (avatar) return true
+
+        // Method 3: no login modal/QR on page
+        const hasLoginModal = !!document.querySelector('.login-container, .qrcode-img, [class*="qrcode"], [class*="qr-code"]')
+        const url = window.location.href
+        // If not on login page AND no login modal visible, likely logged in
+        if (!url.includes('/login') && !hasLoginModal) {
+          // Check for any interactive user element
+          const userElements = document.querySelectorAll('[class*="user"], [class*="avatar"], [class*="profile"], [class*="message"], [class*="notification"], [class*="create"]')
+          if (userElements.length > 3) return true
         }
 
-        // Navigate to explore page
-        logger.info('Navigating to explore page');
-        await this.page.goto('https://www.xiaohongshu.com/explore', {
-          waitUntil: 'domcontentloaded',
-          timeout: timeoutMs
-        });
+        return false
+      })
+    }
 
-        // Check if already logged in
-        const userSidebar = await this.page.$('.user.side-bar-component .channel');
-        if (userSidebar) {
-          const isLoggedIn = await this.page.evaluate(() => {
-            const sidebarUser = document.querySelector('.user.side-bar-component .channel');
-            return sidebarUser?.textContent?.trim() === '我';
-          });
+    if (await checkLoggedIn()) {
+      logger.info('Already logged in')
+      const hostname = new URL(this.page!.url()).hostname
+      await ConfigManager.save({ domain: ConfigManager.detectDomain(hostname) })
+      await this.cookieManager.saveCookies(await this.context!.cookies())
+      return
+    }
 
-          if (isLoggedIn) {
-            logger.info('Already logged in');
-            // Already logged in, save cookies and return
-            const newCookies = await this.context.cookies();
-            await this.cookieManager.saveCookies(newCookies);
-            return;
-          }
+    // Wait for user to scan QR code
+    logger.info('Please scan the QR code in the browser window to log in...')
+
+    const deadline = Date.now() + timeoutSeconds * 1000
+    while (Date.now() < deadline) {
+      if (!this.page) break
+      await this.page.waitForTimeout(3000)
+      if (await checkLoggedIn()) {
+        logger.info('Login complete!')
+        if (this.page) {
+          const hostname = new URL(this.page.url()).hostname
+          await ConfigManager.save({ domain: ConfigManager.detectDomain(hostname) })
         }
-
-        logger.info('Waiting for login dialog');
-        // Wait for login dialog if not logged in
-        await this.page.waitForSelector('.login-container', {
-          timeout: timeoutMs
-        });
-
-        // Wait for QR code image
-        logger.info('Waiting for QR code');
-        const qrCodeImage = await this.page.waitForSelector('.qrcode-img', {
-          timeout: timeoutMs
-        });
-
-        // Wait for user to complete login
-        logger.info('Waiting for user to complete login');
-        await this.page.waitForSelector('.user.side-bar-component .channel', {
-          timeout: timeoutMs * 6
-        });
-
-        // Verify the text content
-        const isLoggedIn = await this.page.evaluate(() => {
-          const sidebarUser = document.querySelector('.user.side-bar-component .channel');
-          return sidebarUser?.textContent?.trim() === '我';
-        });
-
-        if (!isLoggedIn) {
-          logger.error('Login verification failed');
-          throw new Error('Login verification failed');
+        if (this.context) {
+          await this.cookieManager.saveCookies(await this.context.cookies())
         }
-
-        logger.info('Login successful, saving cookies');
-        // Save cookies after successful login
-        const newCookies = await this.context.cookies();
-        await this.cookieManager.saveCookies(newCookies);
-        return;
-      } catch (error) {
-        logger.error(`Login attempt ${retryCount + 1} failed:`, error);
-        // Clean up current session
-        if (this.page) await this.page.close();
-        if (this.context) await this.context.close();
-
-        retryCount++;
-        if (retryCount < maxRetries) {
-          logger.info(`Retrying login in 2 seconds (${retryCount}/${maxRetries})`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        } else {
-          logger.error('Login failed after maximum retries');
-          throw new Error('Login failed after maximum retries');
-        }
+        return
       }
     }
+    throw new Error(`Login timed out after ${timeoutSeconds}s`)
   }
 
   async cleanup(): Promise<void> {

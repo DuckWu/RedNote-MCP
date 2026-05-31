@@ -1,4 +1,5 @@
 import { AuthManager } from '../auth/authManager'
+import { ConfigManager } from '../auth/configManager'
 import { Browser, Page } from 'playwright'
 import logger from '../utils/logger'
 import { GetNoteDetail, NoteDetail } from './noteDetail'
@@ -25,6 +26,7 @@ export class RedNoteTools {
   private authManager: AuthManager
   private browser: Browser | null = null
   private page: Page | null = null
+  private baseUrl: string = 'https://www.xiaohongshu.com'
 
   constructor() {
     logger.info('Initializing RedNoteTools')
@@ -37,10 +39,10 @@ export class RedNoteTools {
     if (!this.browser) {
       throw new Error('Failed to initialize browser')
     }
-    
+
     try {
       this.page = await this.browser.newPage()
-      
+
       // Load cookies if available
       const cookies = await this.authManager.getCookies()
       if (cookies.length > 0) {
@@ -48,13 +50,22 @@ export class RedNoteTools {
         await this.page.context().addCookies(cookies)
       }
 
-      // Check login status
+      // Load saved domain config
+      const config = await ConfigManager.load()
+      this.baseUrl = ConfigManager.getBaseUrl(config)
+      logger.info(`Using base URL: ${this.baseUrl}`)
+
+      // Check login status — simple URL-based detection
       logger.info('Checking login status')
-      await this.page.goto('https://www.xiaohongshu.com')
-      const isLoggedIn = await this.page.evaluate(() => {
-        const sidebarUser = document.querySelector('.user.side-bar-component .channel')
-        return sidebarUser?.textContent?.trim() === '我'
-      })
+      await this.page.goto(`${this.baseUrl}/explore`, { waitUntil: 'domcontentloaded', timeout: 15000 })
+      // Wait for redirects to settle (e.g. xiaohongshu.com → rednote.com)
+      await this.page.waitForTimeout(3000)
+
+      const currentUrl = this.page.url()
+      logger.info(`Current URL after navigation: ${currentUrl}`)
+
+      // Simple check: if on a login page, we're not logged in
+      const isLoggedIn = !currentUrl.includes('/login')
 
       // If not logged in, perform login
       if (!isLoggedIn) {
@@ -106,6 +117,14 @@ export class RedNoteTools {
       return xiaohongshuMatch[1]
     }
 
+    // 匹配 https://www.rednote.com/ 开头的链接
+    const rednoteRegex = /(https?:\/\/(?:www\.)?rednote\.com\/[^，\s]+)/i
+    const rednoteMatch = shareText.match(rednoteRegex)
+
+    if (rednoteMatch && rednoteMatch[1]) {
+      return rednoteMatch[1]
+    }
+
     return shareText
   }
 
@@ -117,7 +136,7 @@ export class RedNoteTools {
 
       // Navigate to search page
       logger.info('Navigating to search page')
-      await this.page.goto(`https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(keywords)}`)
+      await this.page.goto(`${this.baseUrl}/search_result?keyword=${encodeURIComponent(keywords)}`)
 
       // Wait for search results to load
       logger.info('Waiting for search results')
@@ -259,25 +278,47 @@ export class RedNoteTools {
       await this.initialize()
       if (!this.page) throw new Error('Page not initialized')
 
-      await this.page.goto(url)
+      // Use the original URL — don't rewrite domains
+      logger.info(`Navigating to: ${url}`)
+      await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+      // Let the page fully render
+      await this.page.waitForTimeout(3000)
 
-      // Wait for comments to load
-      logger.info('Waiting for comments to load')
-      await this.page.waitForSelector('[role="dialog"] [role="list"]')
-
-      // Extract comments
+      // Extract comments with multiple fallback selectors
+      logger.info('Extracting comments')
       const comments = await this.page.evaluate(() => {
-        const items = document.querySelectorAll('[role="dialog"] [role="list"] [role="listitem"]')
-        const results: Comment[] = []
+        const results: Array<{author: string, content: string, likes: number, time: string}> = []
 
-        items.forEach((item) => {
-          const author = item.querySelector('[data-testid="user-name"]')?.textContent?.trim() || ''
-          const content = item.querySelector('[data-testid="comment-content"]')?.textContent?.trim() || ''
-          const likes = parseInt(item.querySelector('[data-testid="likes-count"]')?.textContent || '0')
-          const time = item.querySelector('time')?.textContent?.trim() || ''
+        // Try multiple selector patterns
+        const patterns = [
+          // xiaohongshu.com pattern
+          { item: '[role="dialog"] [role="list"] [role="listitem"]', author: '[data-testid="user-name"]', content: '[data-testid="comment-content"]', likes: '[data-testid="likes-count"]', time: 'time' },
+          // Generic pattern: any list structure inside a dialog/modal
+          { item: '[role="dialog"] [role="listitem"]', author: '[class*="name"], [class*="author"], [class*="user"]', content: '[class*="content"], [class*="text"], [class*="body"]', likes: '[class*="like"] span, [class*="count"]', time: 'time, [class*="time"], [class*="date"]' },
+          // Comment containers
+          { item: '[class*="comment-item"], [class*="CommentItem"], .comment', author: '[class*="name"], [class*="author"], [class*="username"]', content: '[class*="content"], [class*="text"], [class*="desc"], p', likes: '[class*="like"] span, [class*="count"], [class*="vote"]', time: 'time, [class*="time"], [class*="date"]' },
+          // Ultra-generic: any repeated structure with text
+          { item: '[class*="comment"], [class*="reply"]', author: 'a[href], [class*="name"], strong', content: 'p, span, div', likes: '', time: '' },
+        ]
 
-          results.push({ author, content, likes, time })
-        })
+        for (const pattern of patterns) {
+          const items = document.querySelectorAll(pattern.item)
+          if (items.length > 0) {
+            items.forEach((item) => {
+              const author = pattern.author ? item.querySelector(pattern.author)?.textContent?.trim() || '' : ''
+              const content = pattern.content ? item.querySelector(pattern.content)?.textContent?.trim() || '' : ''
+              const likesEl = pattern.likes ? item.querySelector(pattern.likes) : null
+              const likes = likesEl ? parseInt(likesEl.textContent?.replace(/[^\d]/g, '') || '0') : 0
+              const timeEl = pattern.time ? item.querySelector(pattern.time) : null
+              const time = timeEl?.textContent?.trim() || ''
+
+              if (content.length > 0) {
+                results.push({ author, content, likes, time })
+              }
+            })
+            if (results.length > 0) break
+          }
+        }
 
         return results
       })
